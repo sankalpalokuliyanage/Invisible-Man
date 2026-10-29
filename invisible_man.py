@@ -14,6 +14,54 @@ import numpy as np
 WINDOW_NAME = "Invisible Man"
 
 
+class PersonSegmenter:
+    """Optional YOLO person segmenter with a safe OpenCV-only fallback."""
+
+    def __init__(self, model_name: str, enabled: bool = True) -> None:
+        self.model = None
+        self.error: str | None = None
+        if not enabled:
+            self.error = "disabled"
+            return
+        try:
+            from ultralytics import YOLO
+
+            print(f"Loading segmentation model: {model_name}")
+            self.model = YOLO(model_name)
+        except Exception as exc:  # Model/network/runtime failures must not stop the camera.
+            self.error = str(exc)
+            print(f"YOLO unavailable; using background vision only: {exc}")
+
+    @property
+    def active(self) -> bool:
+        return self.model is not None
+
+    def person_mask(self, frame: np.ndarray) -> np.ndarray:
+        mask = np.zeros(frame.shape[:2], np.uint8)
+        if self.model is None:
+            return mask
+        try:
+            results = self.model.predict(
+                frame, classes=[0], conf=0.32, imgsz=640, verbose=False
+            )
+            result = results[0]
+            if result.masks is None:
+                return mask
+            instances = result.masks.data.cpu().numpy()
+            if len(instances):
+                combined = np.max(instances, axis=0)
+                mask = cv2.resize(
+                    (combined * 255).astype(np.uint8),
+                    (frame.shape[1], frame.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+        except Exception as exc:
+            self.error = str(exc)
+            print(f"YOLO inference failed; continuing with background vision: {exc}")
+            self.model = None
+        return mask
+
+
 @dataclass
 class CloakColor:
     """HSV colour selected from the camera feed."""
@@ -47,6 +95,22 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Seconds used for automatic empty-background capture",
+    )
+    parser.add_argument(
+        "--effect",
+        choices=("foreground", "cloak"),
+        default="foreground",
+        help="Hide every new foreground object, or only the detected cloak colour",
+    )
+    parser.add_argument(
+        "--model",
+        default="yolo26n-seg.pt",
+        help="Ultralytics segmentation model used for person masks",
+    )
+    parser.add_argument(
+        "--no-yolo",
+        action="store_true",
+        help="Use lightweight background vision without loading a YOLO model",
     )
     return parser.parse_args()
 
@@ -225,18 +289,20 @@ def draw_help(
     auto_color: AutoColorState,
     manual_color: bool,
     fps: float,
+    effect: str,
+    yolo_active: bool,
 ) -> None:
     if not background_ready:
         status = "CAPTURING EMPTY BACKGROUND..."
-    elif auto_color.locked or manual_color:
+    elif effect == "foreground" or auto_color.locked or manual_color:
         status = "INVISIBILITY ACTIVE"
     else:
         status = "SHOW A BRIGHT SINGLE-COLOUR CLOTH - DETECTING..."
     color = auto_color.color
     lines = [
         status,
-        "Automatic mode | R: recapture | A: auto colour | M: mask | Q/Esc: quit",
-        f"HSV: {color.hue}, {color.saturation}, {color.value} | confidence: {auto_color.confidence:.0%} | {fps:.0f} FPS",
+        "F: whole foreground | C: cloak colour | R: recapture | M: mask | Q/Esc: quit",
+        f"Mode: {effect} | YOLO: {'ON' if yolo_active else 'OFF'} | confidence: {auto_color.confidence:.0%} | {fps:.0f} FPS",
     ]
     for index, line in enumerate(lines):
         y = 32 + index * 28
@@ -262,6 +328,8 @@ def main() -> int:
     cv2.createTrackbar("Scene difference", WINDOW_NAME, 28, 100, lambda _value: None)
 
     auto_color = AutoColorState(CloakColor())
+    effect = args.effect
+    segmenter = PersonSegmenter(args.model, enabled=not args.no_yolo)
     latest_hsv: np.ndarray | None = None
     background_seconds = max(1.5, args.background_seconds)
     background: np.ndarray | None = capture_background(
@@ -278,6 +346,7 @@ def main() -> int:
     mask_history: np.ndarray | None = None
     fps = 0.0
     previous_tick = time.monotonic()
+    person = np.zeros(background.shape[:2], np.uint8)
 
     def select_color(event: int, x: int, y: int, _flags: int, _data: object) -> None:
         if event != cv2.EVENT_LBUTTONDOWN or latest_hsv is None:
@@ -310,11 +379,23 @@ def main() -> int:
 
             latest_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             changed = foreground_mask(frame, background)
-            if not manual_color and frame_number % 3 == 0:
+            # Neural inference is intentionally sampled; temporal masks bridge
+            # intermediate frames and keep CPU-only machines responsive.
+            if segmenter.active and frame_number % 3 == 0:
+                person = segmenter.person_mask(frame)
+            if not manual_color and effect == "cloak" and frame_number % 3 == 0:
                 auto_color = estimate_cloak_color(latest_hsv, changed, auto_color)
             frame_number += 1
 
-            if auto_color.locked or manual_color:
+            if effect == "foreground":
+                # Background subtraction catches every new object, including
+                # unknown classes. YOLO fills the complete person silhouette.
+                mask = cv2.bitwise_or(changed, person)
+                mask = clean_mask(mask)
+                minimum_area = max(500, int(frame.shape[0] * frame.shape[1] * 0.002))
+                mask = keep_large_regions(mask, minimum_area)
+                mask, mask_history = stabilise_mask(mask, mask_history)
+            elif auto_color.locked or manual_color:
                 colour = hue_mask(latest_hsv, auto_color.color)
                 # Scene-difference gating prevents matching objects in the static
                 # background from accidentally disappearing too.
@@ -338,7 +419,15 @@ def main() -> int:
             instant_fps = 1.0 / max(0.001, now - previous_tick)
             fps = instant_fps if fps == 0.0 else fps * 0.9 + instant_fps * 0.1
             previous_tick = now
-            draw_help(output, background is not None, auto_color, manual_color, fps)
+            draw_help(
+                output,
+                background is not None,
+                auto_color,
+                manual_color,
+                fps,
+                effect,
+                segmenter.active,
+            )
             display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if show_mask else output
             cv2.imshow(WINDOW_NAME, display)
 
@@ -348,6 +437,14 @@ def main() -> int:
             if key == ord("m"):
                 show_mask = not show_mask
             if key == ord("a"):
+                auto_color = AutoColorState(CloakColor())
+                manual_color = False
+                mask_history = None
+            if key == ord("f"):
+                effect = "foreground"
+                mask_history = None
+            if key == ord("c"):
+                effect = "cloak"
                 auto_color = AutoColorState(CloakColor())
                 manual_color = False
                 mask_history = None

@@ -1,6 +1,6 @@
 # Invisible Man — Python + OpenCV
 
-A real-time webcam effect that automatically captures the empty background, detects a coloured cloth, and replaces it with the background to create an "invisibility cloak" illusion.
+A real-time hybrid AI effect that automatically captures the empty background, segments people with YOLO, detects every new foreground object, and replaces those pixels with the background.
 
 ## Requirements
 
@@ -34,9 +34,9 @@ python invisible_man.py --background-seconds 5
 
 1. Start the program and immediately step completely out of view.
 2. The empty background is captured automatically during the three-second countdown.
-3. Return holding or wearing a bright, single-colour cloth.
-4. Hold it clearly in view for a moment. The program detects its dominant colour and starts the effect automatically.
-5. No click or key press is required. The sliders are available only for fine-tuning difficult lighting.
+3. Return to the camera. The person and anything absent from the captured background disappear automatically.
+4. No coloured cloth, click, or key press is required in the default foreground mode.
+5. Press **C** only if you want the original coloured-cloak effect instead.
 
 ### Controls
 
@@ -45,6 +45,8 @@ python invisible_man.py --background-seconds 5
 | Left click | Optional manual colour override |
 | `R` or `B` | Recapture the empty background |
 | `A` | Return to automatic colour detection |
+| `F` | Hide the entire new foreground (default) |
+| `C` | Hide only the automatically detected cloak colour |
 | `M` | Show/hide the detected-colour mask |
 | `Q` or `Esc` | Quit |
 
@@ -59,6 +61,17 @@ The **Hue tolerance** slider expands the detected colour range. **Min saturation
 - Temporal mask blending stabilises cloth edges and reduces flicker.
 - Hue-circle processing supports red correctly across OpenCV's `0/179` boundary.
 - Live confidence and FPS indicators make camera and lighting problems visible.
+- YOLO instance segmentation fills the complete person silhouette, while background differencing also catches objects YOLO does not know.
+
+## AI model
+
+The default `yolo26n-seg.pt` model downloads automatically on the first run. It is the small segmentation model, selected for real-time use. Run without neural inference on a slower computer:
+
+```powershell
+python invisible_man.py --no-yolo
+```
+
+Choose a different compatible Ultralytics segmentation model with `--model MODEL_NAME`.
 
 ## Tips for a better effect
 
