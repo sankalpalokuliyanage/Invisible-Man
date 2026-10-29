@@ -2,6 +2,8 @@
 
 A real-time hybrid AI effect that automatically captures the empty background, segments people with YOLO, detects every new foreground object, and replaces those pixels with the background.
 
+The application includes a custom 1600×900 cinematic interface based on the project UI concept: a large bordered camera stage, snap-status ring, live AI/background cards, clickable mode controls, animation progress line, and FPS/confidence telemetry.
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -49,6 +51,9 @@ python invisible_man.py --background-seconds 5
 | `F` | Hide the entire new foreground (default) |
 | `C` | Hide only the automatically detected cloak colour |
 | `S` | Test/trigger the snap dissolve manually |
+| UI mode buttons | Switch between Snap, Foreground, and Cloak |
+| UI Recapture | Capture a new empty background |
+| UI Mask | Toggle the detection-mask preview |
 | `M` | Show/hide the detected-colour mask |
 | `Q` or `Esc` | Quit |
 

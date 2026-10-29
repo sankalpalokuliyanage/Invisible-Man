@@ -11,10 +11,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from cinematic_ui import CinematicUI
 from snap_effect import DustAnimation, SnapDetector
 
 
 WINDOW_NAME = "Invisible Man"
+HUE_TOLERANCE = 10
+MIN_SATURATION = 80
+MIN_BRIGHTNESS = 55
+SCENE_DIFFERENCE = 28
 
 
 class PersonSegmenter:
@@ -121,9 +126,9 @@ def parse_args() -> argparse.Namespace:
 def hue_mask(hsv: np.ndarray, color: CloakColor) -> np.ndarray:
     """Build an HSV mask while correctly handling OpenCV's hue wrap-around."""
 
-    hue_tolerance = cv2.getTrackbarPos("Hue tolerance", WINDOW_NAME)
-    min_saturation = cv2.getTrackbarPos("Min saturation", WINDOW_NAME)
-    min_value = cv2.getTrackbarPos("Min brightness", WINDOW_NAME)
+    hue_tolerance = HUE_TOLERANCE
+    min_saturation = MIN_SATURATION
+    min_value = MIN_BRIGHTNESS
 
     low_hue = color.hue - hue_tolerance
     high_hue = color.hue + hue_tolerance
@@ -186,7 +191,7 @@ def foreground_mask(frame: np.ndarray, background: np.ndarray) -> np.ndarray:
     difference = cv2.absdiff(frame, background)
     difference = cv2.cvtColor(difference, cv2.COLOR_BGR2GRAY)
     difference = cv2.GaussianBlur(difference, (7, 7), 0)
-    threshold = cv2.getTrackbarPos("Scene difference", WINDOW_NAME)
+    threshold = SCENE_DIFFERENCE
     _, mask = cv2.threshold(difference, threshold, 255, cv2.THRESH_BINARY)
     kernel = np.ones((9, 9), np.uint8)
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -251,7 +256,10 @@ def estimate_cloak_color(
 
 
 def capture_background(
-    camera: cv2.VideoCapture, mirror: bool, seconds: float = 2.5
+    camera: cv2.VideoCapture,
+    mirror: bool,
+    seconds: float = 2.5,
+    ui: CinematicUI | None = None,
 ) -> np.ndarray | None:
     """Average several empty-scene frames to produce a stable background."""
 
@@ -277,6 +285,19 @@ def capture_background(
             2,
             cv2.LINE_AA,
         )
+        if ui is not None:
+            capture_progress = np.clip((time.monotonic() - started) / seconds, 0.0, 1.0)
+            preview = ui.render(
+                preview,
+                "snap",
+                False,
+                False,
+                0.0,
+                0.0,
+                f"STEP OUT - CAPTURING IN {remaining}",
+                float(capture_progress),
+                False,
+            )
         cv2.imshow(WINDOW_NAME, preview)
         cv2.waitKey(1)
 
@@ -331,10 +352,8 @@ def main() -> int:
         return 1
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.createTrackbar("Hue tolerance", WINDOW_NAME, 10, 45, lambda _value: None)
-    cv2.createTrackbar("Min saturation", WINDOW_NAME, 80, 255, lambda _value: None)
-    cv2.createTrackbar("Min brightness", WINDOW_NAME, 55, 255, lambda _value: None)
-    cv2.createTrackbar("Scene difference", WINDOW_NAME, 28, 100, lambda _value: None)
+    cv2.resizeWindow(WINDOW_NAME, CinematicUI.width, CinematicUI.height)
+    ui = CinematicUI()
 
     auto_color = AutoColorState(CloakColor())
     effect = args.effect
@@ -343,7 +362,7 @@ def main() -> int:
     latest_hsv: np.ndarray | None = None
     background_seconds = max(1.5, args.background_seconds)
     background: np.ndarray | None = capture_background(
-        camera, mirror, seconds=background_seconds
+        camera, mirror, seconds=background_seconds, ui=ui
     )
     if background is None:
         print("Automatic background capture failed.")
@@ -359,10 +378,26 @@ def main() -> int:
     person = np.zeros(background.shape[:2], np.uint8)
     animation: DustAnimation | None = None
     snapped_invisible = False
+    pending_action: list[str] = []
 
     def select_color(event: int, x: int, y: int, _flags: int, _data: object) -> None:
-        if event != cv2.EVENT_LBUTTONDOWN or latest_hsv is None:
+        if event != cv2.EVENT_LBUTTONDOWN:
             return
+        action = ui.hit_test(x, y)
+        if action is not None:
+            pending_action.append(action)
+            return
+        if latest_hsv is None or effect != "cloak":
+            return
+        # Convert a click in the letterboxed UI camera viewport to source pixels.
+        vx, vy, vw, vh = ui.camera_rect
+        scale = min(vw / latest_hsv.shape[1], vh / latest_hsv.shape[0])
+        shown_w = int(latest_hsv.shape[1] * scale)
+        shown_h = int(latest_hsv.shape[0] * scale)
+        offset_x = vx + (vw - shown_w) // 2
+        offset_y = vy + (vh - shown_h) // 2
+        x = int((x - offset_x) / scale)
+        y = int((y - offset_y) / scale)
         height, width = latest_hsv.shape[:2]
         if not (0 <= x < width and 0 <= y < height):
             return
@@ -453,46 +488,55 @@ def main() -> int:
             instant_fps = 1.0 / max(0.001, now - previous_tick)
             fps = instant_fps if fps == 0.0 else fps * 0.9 + instant_fps * 0.1
             previous_tick = now
-            draw_help(
-                output,
-                background is not None,
-                auto_color,
-                manual_color,
-                fps,
+            camera_display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if show_mask else output
+            animation_progress = animation.progress if animation is not None else None
+            display = ui.render(
+                camera_display,
                 effect,
                 segmenter.active,
+                background is not None,
+                auto_color.confidence if effect == "cloak" else (0.92 if segmenter.active else 0.65),
+                fps,
+                snap_detector.status,
+                animation_progress,
+                show_mask,
             )
-            display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if show_mask else output
             cv2.imshow(WINDOW_NAME, display)
 
             key = cv2.waitKey(1) & 0xFF
+            action = pending_action.pop(0) if pending_action else None
             if key in (ord("q"), 27):
                 break
-            if key == ord("m"):
+            if key == ord("m") or action == "mask":
                 show_mask = not show_mask
             if key == ord("a"):
                 auto_color = AutoColorState(CloakColor())
                 manual_color = False
                 mask_history = None
-            if key == ord("f"):
+            if key == ord("f") or action == "foreground":
                 effect = "foreground"
                 mask_history = None
                 animation = None
                 snapped_invisible = False
-            if key == ord("c"):
+            if key == ord("c") or action == "cloak":
                 effect = "cloak"
                 auto_color = AutoColorState(CloakColor())
                 manual_color = False
                 mask_history = None
                 animation = None
                 snapped_invisible = False
+            if action == "snap":
+                effect = "snap"
+                animation = None
+                snapped_invisible = False
+                mask_history = None
             if key == ord("s"):
                 effect = "snap"
                 animation = DustAnimation(frame.copy(), mask.copy(), time.monotonic())
                 snapped_invisible = False
-            if key in (ord("b"), ord("r")):
+            if key in (ord("b"), ord("r")) or action == "recapture":
                 new_background = capture_background(
-                    camera, mirror, seconds=background_seconds
+                    camera, mirror, seconds=background_seconds, ui=ui
                 )
                 if new_background is not None:
                     background = new_background
