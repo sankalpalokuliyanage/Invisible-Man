@@ -1,6 +1,6 @@
 # Invisible Man — Python + OpenCV
 
-A real-time webcam effect that replaces a coloured cloth with a previously captured background, creating an "invisibility cloak" illusion.
+A real-time webcam effect that automatically captures the empty background, detects a coloured cloth, and replaces it with the background to create an "invisibility cloak" illusion.
 
 ## Requirements
 
@@ -26,22 +26,23 @@ python invisible_man.py --camera 1
 
 ## How to use
 
-1. Keep the camera still and press **B**.
-2. Step completely out of view while the background is captured.
-3. Return holding or wearing a single-colour cloth.
-4. Click a well-lit area in the middle of the cloth to select its colour.
-5. Adjust the three sliders until the entire cloth disappears cleanly.
+1. Start the program and immediately step completely out of view.
+2. The empty background is captured automatically during the three-second countdown.
+3. Return holding or wearing a bright, single-colour cloth.
+4. Hold it clearly in view for a moment. The program detects its dominant colour and starts the effect automatically.
+5. No click or key press is required. The sliders are available only for fine-tuning difficult lighting.
 
 ### Controls
 
 | Control | Action |
 | --- | --- |
-| Left click | Select the cloak colour |
-| `B` | Recapture the empty background |
+| Left click | Optional manual colour override |
+| `R` or `B` | Recapture the empty background |
+| `A` | Return to automatic colour detection |
 | `M` | Show/hide the detected-colour mask |
 | `Q` or `Esc` | Quit |
 
-The **Hue tolerance** slider expands the selected colour range. **Min saturation** rejects grey/white regions, while **Min brightness** rejects dark shadows.
+The **Hue tolerance** slider expands the detected colour range. **Min saturation** rejects grey/white regions, **Min brightness** rejects dark shadows, and **Scene difference** controls how different an object must be from the empty background.
 
 ## Tips for a better effect
 
