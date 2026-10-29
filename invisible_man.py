@@ -6,9 +6,12 @@ import argparse
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+from snap_effect import DustAnimation, SnapDetector
 
 
 WINDOW_NAME = "Invisible Man"
@@ -98,9 +101,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--effect",
-        choices=("foreground", "cloak"),
-        default="foreground",
-        help="Hide every new foreground object, or only the detected cloak colour",
+        choices=("snap", "foreground", "cloak"),
+        default="snap",
+        help="Snap-triggered dissolve, immediate foreground, or detected cloak colour",
     )
     parser.add_argument(
         "--model",
@@ -168,7 +171,11 @@ def stabilise_mask(mask: np.ndarray, history: np.ndarray | None) -> tuple[np.nda
     if history is None or history.shape != sample.shape:
         history = sample
     else:
-        cv2.accumulateWeighted(sample, history, 0.32)
+        # Acquire new moving pixels immediately but release old pixels quickly.
+        # This removes the trailing/ghosting visible during fast movement.
+        rising = sample >= history
+        history[rising] = history[rising] * 0.12 + sample[rising] * 0.88
+        history[~rising] = history[~rising] * 0.48 + sample[~rising] * 0.52
     stable = np.clip(history * 255.0, 0, 255).astype(np.uint8)
     return cv2.GaussianBlur(stable, (5, 5), 0), history
 
@@ -294,6 +301,8 @@ def draw_help(
 ) -> None:
     if not background_ready:
         status = "CAPTURING EMPTY BACKGROUND..."
+    elif effect == "snap":
+        status = "READY - SNAP YOUR FINGERS TO DISAPPEAR"
     elif effect == "foreground" or auto_color.locked or manual_color:
         status = "INVISIBILITY ACTIVE"
     else:
@@ -301,7 +310,7 @@ def draw_help(
     color = auto_color.color
     lines = [
         status,
-        "F: whole foreground | C: cloak colour | R: recapture | M: mask | Q/Esc: quit",
+        "S: test snap | F: foreground | C: cloak | R: recapture | M: mask | Q/Esc: quit",
         f"Mode: {effect} | YOLO: {'ON' if yolo_active else 'OFF'} | confidence: {auto_color.confidence:.0%} | {fps:.0f} FPS",
     ]
     for index, line in enumerate(lines):
@@ -330,6 +339,7 @@ def main() -> int:
     auto_color = AutoColorState(CloakColor())
     effect = args.effect
     segmenter = PersonSegmenter(args.model, enabled=not args.no_yolo)
+    snap_detector = SnapDetector(Path(__file__).parent / "models" / "hand_landmarker.task")
     latest_hsv: np.ndarray | None = None
     background_seconds = max(1.5, args.background_seconds)
     background: np.ndarray | None = capture_background(
@@ -347,6 +357,8 @@ def main() -> int:
     fps = 0.0
     previous_tick = time.monotonic()
     person = np.zeros(background.shape[:2], np.uint8)
+    animation: DustAnimation | None = None
+    snapped_invisible = False
 
     def select_color(event: int, x: int, y: int, _flags: int, _data: object) -> None:
         if event != cv2.EVENT_LBUTTONDOWN or latest_hsv is None:
@@ -381,16 +393,17 @@ def main() -> int:
             changed = foreground_mask(frame, background)
             # Neural inference is intentionally sampled; temporal masks bridge
             # intermediate frames and keep CPU-only machines responsive.
-            if segmenter.active and frame_number % 3 == 0:
+            if segmenter.active and frame_number % 2 == 0:
                 person = segmenter.person_mask(frame)
             if not manual_color and effect == "cloak" and frame_number % 3 == 0:
                 auto_color = estimate_cloak_color(latest_hsv, changed, auto_color)
             frame_number += 1
 
-            if effect == "foreground":
+            foreground = cv2.bitwise_or(changed, person)
+            if effect in ("foreground", "snap"):
                 # Background subtraction catches every new object, including
                 # unknown classes. YOLO fills the complete person silhouette.
-                mask = cv2.bitwise_or(changed, person)
+                mask = foreground
                 mask = clean_mask(mask)
                 minimum_area = max(500, int(frame.shape[0] * frame.shape[1] * 0.002))
                 mask = keep_large_regions(mask, minimum_area)
@@ -407,15 +420,36 @@ def main() -> int:
                 mask = np.zeros(frame.shape[:2], np.uint8)
                 mask_history = None
 
+            if effect == "snap" and not snapped_invisible and animation is None:
+                effect_mask = np.zeros_like(mask)
+            else:
+                effect_mask = mask
+
             if background is not None:
                 if background.shape != frame.shape:
                     background = cv2.resize(background, (frame.shape[1], frame.shape[0]))
-                alpha = (mask.astype(np.float32) / 255.0)[..., None]
+                alpha = (effect_mask.astype(np.float32) / 255.0)[..., None]
                 output = (background * alpha + frame * (1.0 - alpha)).astype(np.uint8)
             else:
                 output = frame.copy()
 
             now = time.monotonic()
+            timestamp_ms = int(now * 1000)
+            snap_triggered = False
+            if (
+                effect == "snap"
+                and animation is None
+                and not snapped_invisible
+                and frame_number % 2 == 0
+            ):
+                snap_triggered = snap_detector.update(frame, timestamp_ms)
+            if snap_triggered:
+                animation = DustAnimation(frame.copy(), mask.copy(), now)
+            if animation is not None:
+                output = animation.render(frame, background)
+                if animation.complete:
+                    animation = None
+                    snapped_invisible = True
             instant_fps = 1.0 / max(0.001, now - previous_tick)
             fps = instant_fps if fps == 0.0 else fps * 0.9 + instant_fps * 0.1
             previous_tick = now
@@ -443,11 +477,19 @@ def main() -> int:
             if key == ord("f"):
                 effect = "foreground"
                 mask_history = None
+                animation = None
+                snapped_invisible = False
             if key == ord("c"):
                 effect = "cloak"
                 auto_color = AutoColorState(CloakColor())
                 manual_color = False
                 mask_history = None
+                animation = None
+                snapped_invisible = False
+            if key == ord("s"):
+                effect = "snap"
+                animation = DustAnimation(frame.copy(), mask.copy(), time.monotonic())
+                snapped_invisible = False
             if key in (ord("b"), ord("r")):
                 new_background = capture_background(
                     camera, mirror, seconds=background_seconds
@@ -457,9 +499,12 @@ def main() -> int:
                     auto_color = AutoColorState(CloakColor())
                     manual_color = False
                     mask_history = None
+                    animation = None
+                    snapped_invisible = False
                 else:
                     print("Background capture failed; keeping the previous background.")
     finally:
+        snap_detector.close()
         camera.release()
         cv2.destroyAllWindows()
 

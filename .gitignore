@@ -7,3 +7,4 @@ venv/
 *.log
 *.pt
 runs/
+models/*.task

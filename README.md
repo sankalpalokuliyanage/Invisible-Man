@@ -34,9 +34,10 @@ python invisible_man.py --background-seconds 5
 
 1. Start the program and immediately step completely out of view.
 2. The empty background is captured automatically during the three-second countdown.
-3. Return to the camera. The person and anything absent from the captured background disappear automatically.
-4. No coloured cloth, click, or key press is required in the default foreground mode.
-5. Press **C** only if you want the original coloured-cloak effect instead.
+3. Return to the camera and clearly show one hand.
+4. Touch the thumb and middle fingertip, then release the middle finger quickly to perform a snap.
+5. The detected foreground dissolves into dust and becomes invisible. No coloured cloth is required.
+6. Press **F** for immediate foreground invisibility or **C** for the original coloured-cloak effect.
 
 ### Controls
 
@@ -47,6 +48,7 @@ python invisible_man.py --background-seconds 5
 | `A` | Return to automatic colour detection |
 | `F` | Hide the entire new foreground (default) |
 | `C` | Hide only the automatically detected cloak colour |
+| `S` | Test/trigger the snap dissolve manually |
 | `M` | Show/hide the detected-colour mask |
 | `Q` or `Esc` | Quit |
 
@@ -62,6 +64,9 @@ The **Hue tolerance** slider expands the detected colour range. **Min saturation
 - Hue-circle processing supports red correctly across OpenCV's `0/179` boundary.
 - Live confidence and FPS indicators make camera and lighting problems visible.
 - YOLO instance segmentation fills the complete person silhouette, while background differencing also catches objects YOLO does not know.
+- MediaPipe hand landmarks detect a thumb/middle-finger snap sequence.
+- A procedural, asset-free dust-particle dissolve animation runs after the snap.
+- Motion-adaptive mask attack/release removes the long trails caused by older frames.
 
 ## AI model
 
@@ -72,6 +77,8 @@ python invisible_man.py --no-yolo
 ```
 
 Choose a different compatible Ultralytics segmentation model with `--model MODEL_NAME`.
+
+The MediaPipe hand-landmark model also downloads automatically on first use and is stored locally under `models/`. For reliable snap detection, keep the hand well lit, face the palm toward the camera, and perform a clear thumb-to-middle-finger contact followed by a quick release. Press `S` to test the animation independently of gesture recognition.
 
 ## Tips for a better effect
 
