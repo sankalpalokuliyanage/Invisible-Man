@@ -24,6 +24,12 @@ If the wrong camera opens, choose another camera index:
 python invisible_man.py --camera 1
 ```
 
+To spend longer building a cleaner background model:
+
+```powershell
+python invisible_man.py --background-seconds 5
+```
+
 ## How to use
 
 1. Start the program and immediately step completely out of view.
@@ -43,6 +49,16 @@ python invisible_man.py --camera 1
 | `Q` or `Esc` | Quit |
 
 The **Hue tolerance** slider expands the detected colour range. **Min saturation** rejects grey/white regions, **Min brightness** rejects dark shadows, and **Scene difference** controls how different an object must be from the empty background.
+
+## Advanced processing
+
+- Median background modelling removes brief movement and reduces ghost images.
+- Foreground gating protects similarly coloured objects in the static background.
+- Largest-region analysis avoids locking onto small colourful logos or screens.
+- Connected-component filtering removes isolated mask noise.
+- Temporal mask blending stabilises cloth edges and reduces flicker.
+- Hue-circle processing supports red correctly across OpenCV's `0/179` boundary.
+- Live confidence and FPS indicators make camera and lighting problems visible.
 
 ## Tips for a better effect
 

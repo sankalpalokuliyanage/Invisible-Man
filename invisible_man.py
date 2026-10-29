@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -40,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=720, help="Requested frame height")
     parser.add_argument(
         "--no-mirror", action="store_true", help="Do not mirror the camera image"
+    )
+    parser.add_argument(
+        "--background-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds used for automatic empty-background capture",
     )
     return parser.parse_args()
 
@@ -78,6 +85,30 @@ def clean_mask(mask: np.ndarray) -> np.ndarray:
     return cv2.GaussianBlur(mask, (7, 7), 0)
 
 
+def keep_large_regions(mask: np.ndarray, minimum_area: int) -> np.ndarray:
+    """Discard tiny disconnected detections while preserving cloth-sized regions."""
+
+    binary = np.where(mask > 40, 255, 0).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, 8)
+    result = np.zeros_like(binary)
+    for label in range(1, count):
+        if stats[label, cv2.CC_STAT_AREA] >= minimum_area:
+            result[labels == label] = 255
+    return result
+
+
+def stabilise_mask(mask: np.ndarray, history: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+    """Blend consecutive masks to remove edge shimmer and one-frame dropouts."""
+
+    sample = mask.astype(np.float32) / 255.0
+    if history is None or history.shape != sample.shape:
+        history = sample
+    else:
+        cv2.accumulateWeighted(sample, history, 0.32)
+    stable = np.clip(history * 255.0, 0, 255).astype(np.uint8)
+    return cv2.GaussianBlur(stable, (5, 5), 0), history
+
+
 def foreground_mask(frame: np.ndarray, background: np.ndarray) -> np.ndarray:
     """Find pixels that differ from the captured empty scene."""
 
@@ -101,6 +132,15 @@ def estimate_cloak_color(
     region[int(height * 0.12) : int(height * 0.96), int(width * 0.12) : int(width * 0.88)] = 255
     vivid = cv2.inRange(hsv, (0, 85, 55), (179, 255, 255))
     candidates = cv2.bitwise_and(changed, cv2.bitwise_and(vivid, region))
+
+    # Prefer the largest coherent vivid object. This prevents a small logo,
+    # screen, or decoration from becoming the automatically selected cloak.
+    component_floor = max(500, int(height * width * 0.004))
+    coherent = keep_large_regions(candidates, component_floor)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(coherent, 8)
+    if count > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        candidates = np.where(labels == largest, 255, 0).astype(np.uint8)
 
     candidate_count = cv2.countNonZero(candidates)
     minimum_pixels = max(800, int(height * width * 0.008))
@@ -145,7 +185,7 @@ def capture_background(
     """Average several empty-scene frames to produce a stable background."""
 
     started = time.monotonic()
-    samples: list[np.ndarray] = []
+    samples: deque[np.ndarray] = deque(maxlen=30)
 
     while time.monotonic() - started < seconds:
         ok, frame = camera.read()
@@ -174,7 +214,9 @@ def capture_background(
 
     if not samples:
         return None
-    return np.mean(samples[-30:], axis=0).astype(np.uint8)
+    # A median ignores brief movement that would otherwise become a ghost in
+    # the captured background.
+    return np.median(np.stack(tuple(samples), axis=0), axis=0).astype(np.uint8)
 
 
 def draw_help(
@@ -182,6 +224,7 @@ def draw_help(
     background_ready: bool,
     auto_color: AutoColorState,
     manual_color: bool,
+    fps: float,
 ) -> None:
     if not background_ready:
         status = "CAPTURING EMPTY BACKGROUND..."
@@ -193,7 +236,7 @@ def draw_help(
     lines = [
         status,
         "Automatic mode | R: recapture | A: auto colour | M: mask | Q/Esc: quit",
-        f"HSV: {color.hue}, {color.saturation}, {color.value} | confidence: {auto_color.confidence:.0%}",
+        f"HSV: {color.hue}, {color.saturation}, {color.value} | confidence: {auto_color.confidence:.0%} | {fps:.0f} FPS",
     ]
     for index, line in enumerate(lines):
         y = 32 + index * 28
@@ -220,7 +263,10 @@ def main() -> int:
 
     auto_color = AutoColorState(CloakColor())
     latest_hsv: np.ndarray | None = None
-    background: np.ndarray | None = capture_background(camera, mirror, seconds=3.0)
+    background_seconds = max(1.5, args.background_seconds)
+    background: np.ndarray | None = capture_background(
+        camera, mirror, seconds=background_seconds
+    )
     if background is None:
         print("Automatic background capture failed.")
         camera.release()
@@ -229,6 +275,9 @@ def main() -> int:
     show_mask = False
     manual_color = False
     frame_number = 0
+    mask_history: np.ndarray | None = None
+    fps = 0.0
+    previous_tick = time.monotonic()
 
     def select_color(event: int, x: int, y: int, _flags: int, _data: object) -> None:
         if event != cv2.EVENT_LBUTTONDOWN or latest_hsv is None:
@@ -270,8 +319,12 @@ def main() -> int:
                 # Scene-difference gating prevents matching objects in the static
                 # background from accidentally disappearing too.
                 mask = clean_mask(cv2.bitwise_and(colour, changed))
+                minimum_area = max(350, int(frame.shape[0] * frame.shape[1] * 0.0015))
+                mask = keep_large_regions(mask, minimum_area)
+                mask, mask_history = stabilise_mask(mask, mask_history)
             else:
                 mask = np.zeros(frame.shape[:2], np.uint8)
+                mask_history = None
 
             if background is not None:
                 if background.shape != frame.shape:
@@ -281,7 +334,11 @@ def main() -> int:
             else:
                 output = frame.copy()
 
-            draw_help(output, background is not None, auto_color, manual_color)
+            now = time.monotonic()
+            instant_fps = 1.0 / max(0.001, now - previous_tick)
+            fps = instant_fps if fps == 0.0 else fps * 0.9 + instant_fps * 0.1
+            previous_tick = now
+            draw_help(output, background is not None, auto_color, manual_color, fps)
             display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if show_mask else output
             cv2.imshow(WINDOW_NAME, display)
 
@@ -293,12 +350,16 @@ def main() -> int:
             if key == ord("a"):
                 auto_color = AutoColorState(CloakColor())
                 manual_color = False
+                mask_history = None
             if key in (ord("b"), ord("r")):
-                new_background = capture_background(camera, mirror, seconds=3.0)
+                new_background = capture_background(
+                    camera, mirror, seconds=background_seconds
+                )
                 if new_background is not None:
                     background = new_background
                     auto_color = AutoColorState(CloakColor())
                     manual_color = False
+                    mask_history = None
                 else:
                     print("Background capture failed; keeping the previous background.")
     finally:
